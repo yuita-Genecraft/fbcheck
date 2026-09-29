@@ -206,7 +206,7 @@ function runChecks(P) {
   if (ruleFiles.length === 0) {
     if (fb.length) add("danger", {
       title: "セキュリティルールのファイルが見つかりません",
-      why: "Firestore / Storage は「誰が何を読み書きしてよいか」をルールで決めます。ファイルが無い場合、コンソールで設定したルールがそのまま生きています。テストモードのまま公開すると、データベース全体を誰でも読める状態になります。",
+      why: "Firestore / Storage は「誰が何を読み書きしてよいか」をルールで決めます。ファイルが無い場合、コンソールで設定したルールがそのまま生きています。テストモードの期限内なら、ログインなしで誰でも全体を読み書きできます。",
       how: "Firebase コンソール →（Firestore Database / Storage）→「ルール」タブを開いて、今の中身を確かめてください。中身を AI に貼って「このルールで、誰が何を読めるか1行ずつ説明して」と聞くと、何が起きるかが分かります。",
       evidence: [{ note: hasFirebaseJson ? "firebase.json はあるのに .rules ファイルが無い＝ルールがコード管理されていない" : "プロジェクト内に *.rules / database.rules.json が1つも見つからない" }],
     });
@@ -316,7 +316,7 @@ function runChecks(P) {
   });
   if (sourceHits.length) add("warn", {
     title: "ソースコードに秘密の鍵が直書きされています",
-    why: "まだ配布物には入っていなくても、GitHub に上げた瞬間、ビルドに含めた瞬間に公開されます。git の履歴に一度入ると、あとからファイルを消しても履歴から取り出せます。",
+    why: "まだ配布物には入っていなくても、ビルドに含めて配ったり、公開リポジトリに上げたりした時点で公開されます。git の履歴に一度入ると、あとからファイルを消しても履歴から取り出せます。",
     how: "サーバー側だけで読む環境変数に移し、その .env を Git の管理から外します。既に push 済みなら、鍵の作り直しが必要です。",
     evidence: sourceHits,
   });
@@ -350,7 +350,7 @@ function runChecks(P) {
     const THREE = ".env に鍵を置いてよいのは、1) サーバー側だけで読む 2) Git の管理から外す 3) VITE_ や NEXT_PUBLIC_ などブラウザに配る接頭辞を付けない、の3つがそろう時です。ここでは 2) を見ています。";
     if (tracked.length) add("danger", {
       title: "Git で追跡されている .env ファイルがあります",
-      why: THREE + ".gitignore は、まだ Git に入っていないファイルにだけ効きます。一度コミットした .env は、あとから .gitignore に書いても追跡されたままで、push するとそのまま公開されます。git の履歴にも残ります。",
+      why: THREE + ".gitignore は、まだ Git に入っていないファイルにだけ効きます。一度コミットした .env は、あとから .gitignore に書いても追跡されたままで、公開リポジトリに push すると、そのまま公開されます。git の履歴にも残ります。",
       how: "`git rm --cached -- ファイル名` で追跡を外してコミットし、中の鍵は発行元で作り直してください（履歴に残った鍵は戻せません）。",
       evidence: tracked,
     });
@@ -362,13 +362,13 @@ function runChecks(P) {
     });
     if (noPattern.length) add("danger", {
       title: ".gitignore に除外する行が見つからない .env ファイルがあります",
-      why: THREE + "Git の管理から外れていないと、GitHub に上げた時にそのまま公開されます。公開リポジトリを機械で巡回して鍵を集める行為が、日常的に行われています。ここでは、プロジェクト直下の .gitignore だけを読んでいます。",
+      why: THREE + "Git の管理から外れていないと、コミットして公開リポジトリに上げた時に、そのまま公開されます。公開リポジトリを機械で巡回して鍵を集める行為が、日常的に行われています。ここでは、プロジェクト直下の .gitignore だけを読んでいます。",
       how: ".gitignore に `.env*` の行を足すのが確実です（見本として共有したい .env.example は、その下に `!.env.example` と書けば戻せます）。すでにコミットしたことがあるファイルは .gitignore に書いても外れないので、`git rm --cached -- ファイル名` で管理から外し、中の鍵は作り直してください。",
       evidence: noPattern,
     });
     if (unconfirmed.length) add("warn", {
       title: ".env が Git で追跡済みかは、ここでは確かめられません",
-      why: "直下の .gitignore に除外の行はあります。ただし .gitignore は、まだ Git に入っていないファイルにだけ効きます。一度コミットした .env は追跡されたままです。また、下の階層の .gitignore にある `!.env` のような行で、除外が打ち消されていることもあります。今回は Git の記録（.git の中）を読めていないので（ブラウザ版、または git リポジトリの外で実行した時）、この2つは確かめられません。",
+      why: "直下の .gitignore に除外の行はあります。ただし .gitignore は、まだ Git に入っていないファイルにだけ効きます。一度コミットした .env は追跡されたままです。また、下の階層の .gitignore にある `!.env` のような行で、除外が打ち消されていることもあります。今回は Git の記録（.git の中）を読めていないので（ブラウザ版、または git リポジトリの外や git の無い環境で実行した時）、この2つは確かめられません。",
       how: "ターミナルでプロジェクトのフォルダに移動して `git ls-files -- .env` を実行します。ファイル名が表示されたら追跡済みです（`git rm --cached -- .env` で外し、鍵を作り直す）。下の階層の .gitignore まで含めて確かめるには `git check-ignore -v -- ファイル名`。Node.js 版の fbcheck を git リポジトリの中で実行すると、この2つを git 自身で確かめます。",
       evidence: unconfirmed,
     });
@@ -409,7 +409,7 @@ function runChecks(P) {
   if (found) add("info", {
     title: "Firebase の apiKey がフロントに出ているのは、正常です",
     why: "これは秘密の鍵ではなく、どのプロジェクト宛かを示す識別子です。Firebase の公式ドキュメントにも、Firebase のサービスだけに制限されたキーは秘密として扱う必要はない、と書かれています。ここを隠そうとして時間を使う人が多いのですが、守っているのは apiKey ではなく「セキュリティルール」の方です。上のルールの項目を先に見てください。",
-    how: "隠す対応は要りません。確かめるなら、Google Cloud コンソールでこのキーの「API の制限」が Firebase 関連の API だけになっているかを見ます（Firebase が自動で作ったキーは、2024年5月から自動でそう制限されています）。Maps や Gemini など別の API を使うときは、このキーに足さず、別のキーを作ってその API だけに制限します。",
+    how: "隠す対応は要りません。確かめるなら、Google Cloud コンソールでこのキーの「API の制限」が Firebase 関連の API だけになっているかを見ます（2024年5月以降に Firebase が自動で作ったキーは、最初からそう制限されています。それより前に作られたキーは、Firebase 以外の API も許可に入っていることがあります）。Maps や Gemini など別の API を使うときは、このキーに足さず、別のキーを作ってその API だけに制限します。",
     evidence: [{ loc: found, note: "（対応不要）" }],
   });
 
@@ -514,7 +514,7 @@ function main() {
   console.log(`読んだファイル: ${files.length} 件`);
 
   const envStatus = gitEnvStatus(files.filter((f) => f.name.startsWith(".env") && !TEMPLATE_ENV.test(f.name)).map((f) => f.rel));
-  console.log(envStatus ? "Git：.env の追跡と除外を git 自身で確かめます" : "Git：git リポジトリの外なので、.env が追跡済みかは確かめられません");
+  console.log(envStatus ? "Git：.env の追跡と除外を git 自身で確かめます" : "Git：git が無いか git リポジトリの外なので、.env が追跡済みかは確かめられません");
   const res = runChecks({
     files: files.map(({ rel, name }) => ({ rel, name })),
     texts: new Map(files.map((f) => [f.rel, read(f.abs)])),
