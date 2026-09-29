@@ -245,6 +245,8 @@ function checkSecrets(files) {
   for (const p of files) {
     const r = rel(p);
     if (/(^|[\\/])\.env\.example$/.test(r)) continue;
+    // .env は鍵を置く場所なので「直書き」には数えない（.env の扱いは checkEnv で見る）
+    if (path.basename(p).startsWith(".env")) continue;
     const text = read(p);
     if (text == null) continue;
 
