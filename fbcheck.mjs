@@ -12,6 +12,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 /* ENGINE:BEGIN — fbcheck の判定本体。CLI（fbcheck.mjs）とブラウザ版で、この区間は同じ文字列を使う。 */
 const FBCHECK_VERSION = "0.2";
@@ -172,7 +173,7 @@ function gitignoreCovers(gi, rel) {
 }
 
 // ---------- 判定 ----------
-// P = { files: [{ rel, name }]（rel は / 区切り・並び順どおりに判定）, texts: Map(rel → 中身|null), gitignore: 直下の .gitignore の中身|null }
+// P = { files: [{ rel, name }]（rel は / 区切り・並び順どおりに判定）, texts: Map(rel → 中身|null), gitignore: 直下の .gitignore の中身|null, envStatus?: Map(rel → Git の状態) }
 function runChecks(P) {
   const findings = { danger: [], warn: [], info: [], ok: [] };
   const add = (level, f) => findings[level].push({ ...f, kind: level });
@@ -282,11 +283,15 @@ function runChecks(P) {
     for (const t of tests) {
       const expired = new Date(t.y, t.m - 1, t.d).getTime() < Date.now();
       add(expired ? "warn" : "danger", {
-        title: expired ? `テストモードのルールが残っています（期限切れ・${f.rel}）` : `テストモードのルールが有効です（${f.rel}）`,
+        title: expired
+          ? `期限切れの無認証許可ルールがあります（Firebase のテストモードと同じ形・${f.rel}）`
+          : `期限まで無認証で許可するルールがあります（Firebase のテストモードと同じ形・${f.rel}）`,
         why: expired
-          ? "Firebase がテストモードで作るルールと同じ形です。期限が過ぎているので、今は拒否されているはずです。アプリが動かない原因がこれの可能性があります。"
-          : `Firebase がテストモードで作る「◯月◯日までは誰でも OK」のルールと同じ形です。期限までは、ログインも不要で誰でも行えます。許可されている操作：${OPS_JA(t.ev.ops)}。`,
-        how: "本番用のルールに書き換えます。どのデータを誰に見せたいかを決めてから、AI に書き換えを頼んでください。",
+          ? `この allow の条件は期限（${t.y}年${t.m}月${t.d}日）を過ぎているので、この条件だけでは許可しません。ただし Firestore / Storage のルールは、同じリクエストに当てはまる allow のどれか1つでも true なら許可します。別の allow が true なら、アクセスは許可されます。この行で許可していた操作：${OPS_JA(t.ev.ops)}。`
+          : `期限（${t.y}年${t.m}月${t.d}日）までは、ログインも不要で誰でも行えます。許可されている操作：${OPS_JA(t.ev.ops)}。`,
+        how: expired
+          ? "使っていない行なら消します。ルールを書き直すときは、どのデータを誰に見せたいかを決めてから、AI に頼んでください。"
+          : "本番用のルールに書き換えます。どのデータを誰に見せたいかを決めてから、AI に書き換えを頼んでください。",
         evidence: [{ loc: t.ev.loc, code: t.ev.code, mark: t.ev.mark }],
       });
     }
@@ -318,15 +323,54 @@ function runChecks(P) {
   if (!bundleHits.length && !sourceHits.length) add("ok", { title: "ソースコードと配布ファイルには、分かる範囲で秘密の鍵の直書きは見つかりませんでした（.env は別の項目で見ています）" });
 
   // 3. .env の扱い（Git の管理から外れているか／ブラウザに配られる名前になっていないか）
+  //    P.envStatus: Map(rel → "tracked" | "untracked_ignored" | "untracked_not_ignored" | "unknown")
+  //    Node.js 版は git 自身（ls-files / check-ignore）で埋める。Git の記録を読めない時（ブラウザ版など）は unknown。
+  //    unknown の時は「Git の管理外」とは言わない。直下の .gitignore に除外の行があっても「未確認」として出す。
   const envs = P.files.filter((f) => f.name.startsWith(".env") && !TEMPLATE_ENV.test(f.name));
   if (envs.length) {
-    const notCovered = [];
-    for (const f of envs) { const c = gitignoreCovers(P.gitignore, f.rel); if (!c.covered) notCovered.push({ loc: f.rel, note: `（${c.reason}）` }); }
-    if (notCovered.length) add("danger", {
-      title: ".gitignore で除外を確かめられない .env ファイルがあります",
-      why: ".env に鍵を置いてよいのは、1) サーバー側だけで読む 2) Git の管理から外す 3) VITE_ や NEXT_PUBLIC_ などブラウザに配る接頭辞を付けない、の3つがそろう時です。ここでは 2) を見ています。Git の管理から外れていないと、GitHub に上げた時にそのまま公開されます。公開リポジトリを機械で巡回して鍵を集める行為が、日常的に行われています。このチェックはプロジェクト直下の .gitignore だけを読み、そのファイルを除外すると言い切れる行があるかを見ています（言い切れない時は、ここに出します）。",
-      how: ".gitignore に `.env*` の行を足すのが確実です（見本として共有したい .env.example は、その下に `!.env.example` と書けば戻せます）。すでにコミットしたことがあるファイルは .gitignore に書いても外れないので、`git rm --cached ファイル名` で管理から外し、中の鍵は作り直してください。",
-      evidence: notCovered,
+    const statusOf = (rel) => (P.envStatus && P.envStatus.get(rel)) || "unknown";
+    const keyNote = (rel) => {
+      const t = read(rel);
+      if (t == null) return "";
+      const names = [...new Set(SECRETS.filter((x) => t.split(/\r?\n/).some((ln) => x.re.test(ln))).map((x) => x.name))];
+      return names.length ? `・鍵らしき値あり：${names.join("、")}` : "";
+    };
+    const tracked = [], notIgnored = [], noPattern = [], unconfirmed = [];
+    for (const f of envs) {
+      const st = statusOf(f.rel);
+      if (st === "untracked_ignored") continue;
+      if (st === "tracked") tracked.push({ loc: f.rel, note: `（Git で追跡中${keyNote(f.rel)}）` });
+      else if (st === "untracked_not_ignored") notIgnored.push({ loc: f.rel, note: `（git check-ignore で除外されていない${keyNote(f.rel)}）` });
+      else {
+        const c = gitignoreCovers(P.gitignore, f.rel);
+        if (c.covered) unconfirmed.push({ loc: f.rel, note: `（直下の .gitignore に除外の行あり・追跡済みかは未確認${keyNote(f.rel)}）` });
+        else noPattern.push({ loc: f.rel, note: `（${c.reason}${keyNote(f.rel)}）` });
+      }
+    }
+    const THREE = ".env に鍵を置いてよいのは、1) サーバー側だけで読む 2) Git の管理から外す 3) VITE_ や NEXT_PUBLIC_ などブラウザに配る接頭辞を付けない、の3つがそろう時です。ここでは 2) を見ています。";
+    if (tracked.length) add("danger", {
+      title: "Git で追跡されている .env ファイルがあります",
+      why: THREE + ".gitignore は、まだ Git に入っていないファイルにだけ効きます。一度コミットした .env は、あとから .gitignore に書いても追跡されたままで、push するとそのまま公開されます。git の履歴にも残ります。",
+      how: "`git rm --cached -- ファイル名` で追跡を外してコミットし、中の鍵は発行元で作り直してください（履歴に残った鍵は戻せません）。",
+      evidence: tracked,
+    });
+    if (notIgnored.length) add("danger", {
+      title: "Git の管理から外れていない .env ファイルがあります",
+      why: THREE + "git 自身（git check-ignore）で確かめたところ、除外されていません。下の階層の .gitignore にある `!.env` のような行で、除外が打ち消されていることもあります。",
+      how: "`git check-ignore -v -- ファイル名` でどの行が効いているかを確かめ、.gitignore に `.env*` を足すか、打ち消している行を外します。",
+      evidence: notIgnored,
+    });
+    if (noPattern.length) add("danger", {
+      title: ".gitignore に除外する行が見つからない .env ファイルがあります",
+      why: THREE + "Git の管理から外れていないと、GitHub に上げた時にそのまま公開されます。公開リポジトリを機械で巡回して鍵を集める行為が、日常的に行われています。ここでは、プロジェクト直下の .gitignore だけを読んでいます。",
+      how: ".gitignore に `.env*` の行を足すのが確実です（見本として共有したい .env.example は、その下に `!.env.example` と書けば戻せます）。すでにコミットしたことがあるファイルは .gitignore に書いても外れないので、`git rm --cached -- ファイル名` で管理から外し、中の鍵は作り直してください。",
+      evidence: noPattern,
+    });
+    if (unconfirmed.length) add("warn", {
+      title: ".env が Git で追跡済みかは、ここでは確かめられません",
+      why: "直下の .gitignore に除外の行はあります。ただし .gitignore は、まだ Git に入っていないファイルにだけ効きます。一度コミットした .env は追跡されたままです。また、下の階層の .gitignore にある `!.env` のような行で、除外が打ち消されていることもあります。今回は Git の記録（.git の中）を読めていないので（ブラウザ版、または git リポジトリの外で実行した時）、この2つは確かめられません。",
+      how: "ターミナルでプロジェクトのフォルダに移動して `git ls-files -- .env` を実行します。ファイル名が表示されたら追跡済みです（`git rm --cached -- .env` で外し、鍵を作り直す）。下の階層の .gitignore まで含めて確かめるには `git check-ignore -v -- ファイル名`。Node.js 版の fbcheck を git リポジトリの中で実行すると、この2つを git 自身で確かめます。",
+      evidence: unconfirmed,
     });
     for (const f of envs) {
       const text = read(f.rel);
@@ -364,8 +408,8 @@ function runChecks(P) {
   }
   if (found) add("info", {
     title: "Firebase の apiKey がフロントに出ているのは、正常です",
-    why: "これは秘密の鍵ではなく、どのプロジェクト宛かを示す識別子です。公開前提で配られます。Firebase の公式ドキュメントにもそう書かれています。ここを隠そうとして時間を使う人が多いのですが、守っているのは apiKey ではなく「セキュリティルール」の方です。上のルールの項目を先に見てください。",
-    how: "対応は要りません。ただし Google Cloud コンソールで API キーの利用制限（HTTP リファラ）を掛けておくと、無駄な課金を防げます。",
+    why: "これは秘密の鍵ではなく、どのプロジェクト宛かを示す識別子です。Firebase の公式ドキュメントにも、Firebase のサービスだけに制限されたキーは秘密として扱う必要はない、と書かれています。ここを隠そうとして時間を使う人が多いのですが、守っているのは apiKey ではなく「セキュリティルール」の方です。上のルールの項目を先に見てください。",
+    how: "隠す対応は要りません。確かめるなら、Google Cloud コンソールでこのキーの「API の制限」が Firebase 関連の API だけになっているかを見ます（Firebase が自動で作ったキーは、2024年5月から自動でそう制限されています）。Maps や Gemini など別の API を使うときは、このキーに足さず、別のキーを作ってその API だけに制限します。",
     evidence: [{ loc: found, note: "（対応不要）" }],
   });
 
@@ -414,6 +458,27 @@ const read = (p) => {
 };
 const toRel = (p) => (path.relative(ROOT, p) || path.basename(p)).split(path.sep).join("/");
 
+// .env が Git で追跡されているか・除外されているかを、git 自身に確かめさせる。
+// git が無い／git リポジトリの外なら null（＝判定は「未確認」になる）。ネットワークには出ない。
+function gitEnvStatus(rels) {
+  // ls-files はパスを glob として読まないよう --literal-pathspecs を付ける（check-ignore はこの指定を受け付けない）
+  const git = (args, pre = []) => execFileSync("git", [...pre, "-C", ROOT, ...args], { stdio: ["ignore", "pipe", "ignore"] });
+  try { if (String(git(["rev-parse", "--is-inside-work-tree"])).trim() !== "true") return null; } catch { return null; }
+  const out = new Map();
+  for (const rel of rels) {
+    let st = "unknown";
+    try { git(["ls-files", "--error-unmatch", "--", rel], ["--literal-pathspecs"]); st = "tracked"; }
+    catch (e) {
+      if (e.status === 1) {
+        try { git(["check-ignore", "-q", "--", rel]); st = "untracked_ignored"; }
+        catch (e2) { st = e2.status === 1 ? "untracked_not_ignored" : "unknown"; }
+      }
+    }
+    out.set(rel, st);
+  }
+  return out;
+}
+
 // ---------- 出力 ----------
 
 function box(label) {
@@ -448,10 +513,13 @@ function main() {
     .sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
   console.log(`読んだファイル: ${files.length} 件`);
 
+  const envStatus = gitEnvStatus(files.filter((f) => f.name.startsWith(".env") && !TEMPLATE_ENV.test(f.name)).map((f) => f.rel));
+  console.log(envStatus ? "Git：.env の追跡と除外を git 自身で確かめます" : "Git：git リポジトリの外なので、.env が追跡済みかは確かめられません");
   const res = runChecks({
     files: files.map(({ rel, name }) => ({ rel, name })),
     texts: new Map(files.map((f) => [f.rel, read(f.abs)])),
     gitignore: read(path.join(ROOT, ".gitignore")),
+    envStatus,
   });
   if (res.fb.length) {
     console.log(`Firebase を検出: ${res.fb.slice(0, 3).join(" / ")}`);
