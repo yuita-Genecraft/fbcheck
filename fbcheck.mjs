@@ -15,7 +15,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 
 /* ENGINE:BEGIN — fbcheck の判定本体。CLI（fbcheck.mjs）とブラウザ版で、この区間は同じ文字列を使う。 */
-const FBCHECK_VERSION = "0.3.1";
+const FBCHECK_VERSION = "0.3.3";
 const SKIP_DIRS = new Set([
   "node_modules", ".git", ".next", ".nuxt", ".cache", ".vercel",
   ".firebase", "coverage", ".turbo", ".svelte-kit", "vendor",
@@ -234,11 +234,17 @@ const COND_TEST = /^request\.time\s*<\s*timestamp\.date\(\s*(\d{4})\s*,\s*(\d{1,
 const OPERAND = String.raw`(?:[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*|-?\d+(?:\.\d+)?|"[^"\\]*"|'[^'\\]*'|true|false|null)`;
 const TERM_CMP = new RegExp(`^(${OPERAND})\\s*(==|!=|<=|>=|<|>)\\s*(${OPERAND})$`);
 const TERM_IS = new RegExp(`^${OPERAND}\\s+is\\s+(?:string|int|float|number|bool|list|map|timestamp|path|latlng|bytes|duration)$`);
+// 持ち主の定番の形：`request.auth != null`（`.uid` 付きは含まない）と `request.auth.uid == 識別子`（左右どちらでも）を && で1つずつつないだ物。全体がちょうどこの形の時だけ known（3項以上・ほかの項・|| が付けば unknown のまま）
+const ID_PATH = String.raw`(?!(?:true|false|null)\b)(?!request\.auth\.uid\b)[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*`;
+const UID_EQ = String.raw`(?:request\.auth\.uid\s*==\s*${ID_PATH}|${ID_PATH}\s*==\s*request\.auth\.uid)`;
+const AUTH_NN = String.raw`request\.auth\s*!=\s*null`;
+const OWNER_FORM = new RegExp(`^(?:${AUTH_NN}\\s*&&\\s*${UID_EQ}|${UID_EQ}\\s*&&\\s*${AUTH_NN})$`);
 // 条件の種類："true"（誰でも）・"auth"（ログインしていれば誰でも）・"known"（1つの比較・型の検査・false）・"unknown"（それ以外）
 function condKind(c) {
   c = c.trim();
   if (c === "true") return "true";
   if (COND_AUTH.test(c)) return "auth";
+  if (OWNER_FORM.test(c)) return "known";
   if (/&&|\|\|/.test(c)) return "unknown";
   if (c === "false" || TERM_CMP.test(c) || TERM_IS.test(c)) return "known";
   return "unknown";
@@ -493,7 +499,7 @@ function runChecks(P) {
     }
     if (unresolved.length) add("warn", {
       title: `判定できなかった allow の行があります（${unresolved.length} 行・${f.rel}）`,
-      why: "この行の条件は、ここでは読み取れませんでした。「問題なし」という意味ではありません。条件が次の行にある・関数（isSignedIn() など）を呼んでいる・括弧や || を使っている、といった書き方がこれに当たります。条件が常に true になる書き方でも、ここでは見分けられません。",
+      why: "この allow の条件は、このチェックが読める形に当たらなかったため、安全かどうかを判定していません。「問題なし」という意味ではありません。手で確かめてください。条件が常に true になる書き方でも、ここでは見分けられません。",
       how: "この行が、誰に何を許可しているかを自分で確かめてください。中身を AI に貼って「この条件で、誰が何を読めるか1行ずつ説明して」と聞くと、何が起きるかが分かります。",
       evidence: unresolved,
     });
