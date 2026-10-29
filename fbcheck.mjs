@@ -15,7 +15,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 
 /* ENGINE:BEGIN — fbcheck の判定本体。CLI（fbcheck.mjs）とブラウザ版で、この区間は同じ文字列を使う。 */
-const FBCHECK_VERSION = "0.3.3";
+const FBCHECK_VERSION = "0.3.4";
 const SKIP_DIRS = new Set([
   "node_modules", ".git", ".next", ".nuxt", ".cache", ".vercel",
   ".firebase", "coverage", ".turbo", ".svelte-kit", "vendor",
@@ -233,12 +233,13 @@ const COND_TEST = /^request\.time\s*<\s*timestamp\.date\(\s*(\d{4})\s*,\s*(\d{1,
 // 部分一致や先頭の項だけでは決めない。&& か || を1つでも含む条件は、両辺が読めても読めたことにしない（true として扱うのも、全体がちょうど true の時だけ）
 const OPERAND = String.raw`(?:[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*|-?\d+(?:\.\d+)?|"[^"\\]*"|'[^'\\]*'|true|false|null)`;
 const TERM_CMP = new RegExp(`^(${OPERAND})\\s*(==|!=|<=|>=|<|>)\\s*(${OPERAND})$`);
-const TERM_IS = new RegExp(`^${OPERAND}\\s+is\\s+(?:string|int|float|number|bool|list|map|timestamp|path|latlng|bytes|duration)$`);
+const TERM_IS = new RegExp(`^(${OPERAND})\\s+is\\s+(?:string|int|float|number|bool|list|map|timestamp|path|latlng|bytes|duration)$`);
 // 持ち主の定番の形：`request.auth != null`（`.uid` 付きは含まない）と `request.auth.uid == 識別子`（左右どちらでも）を && で1つずつつないだ物。全体がちょうどこの形の時だけ known（3項以上・ほかの項・|| が付けば unknown のまま）
 const ID_PATH = String.raw`(?!(?:true|false|null)\b)(?!request\.auth\.uid\b)[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*`;
 const UID_EQ = String.raw`(?:request\.auth\.uid\s*==\s*${ID_PATH}|${ID_PATH}\s*==\s*request\.auth\.uid)`;
 const AUTH_NN = String.raw`request\.auth\s*!=\s*null`;
 const OWNER_FORM = new RegExp(`^(?:${AUTH_NN}\\s*&&\\s*${UID_EQ}|${UID_EQ}\\s*&&\\s*${AUTH_NN})$`);
+const LITERAL = /^(?:-?\d+(?:\.\d+)?|"[^"]*"|'[^']*'|true|false|null)$/;
 // 条件の種類："true"（誰でも）・"auth"（ログインしていれば誰でも）・"known"（1つの比較・型の検査・false）・"unknown"（それ以外）
 function condKind(c) {
   c = c.trim();
@@ -246,7 +247,11 @@ function condKind(c) {
   if (COND_AUTH.test(c)) return "auth";
   if (OWNER_FORM.test(c)) return "known";
   if (/&&|\|\|/.test(c)) return "unknown";
-  if (c === "false" || TERM_CMP.test(c) || TERM_IS.test(c)) return "known";
+  if (c === "false") return "known";
+  const m = c.match(TERM_CMP);
+  if (m) return LITERAL.test(m[1]) && LITERAL.test(m[3]) || m[1] === m[3] ? "unknown" : "known";   // 左右がどちらも字（true == true・1 == 1）や同じ名前同士は、結果が決まっていて「誰を許すか」を読めない＝known にしない
+  const is = c.match(TERM_IS);
+  if (is) return LITERAL.test(is[1]) ? "unknown" : "known";   // 左辺は正規表現の捕獲で取る（文字列の中の " is " で切らない）
   return "unknown";
 }
 const COND_KNOWN = (c) => condKind(c) === "known";
