@@ -15,7 +15,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 
 /* ENGINE:BEGIN — fbcheck の判定本体。CLI（fbcheck.mjs）とブラウザ版で、この区間は同じ文字列を使う。 */
-const FBCHECK_VERSION = "0.3";
+const FBCHECK_VERSION = "0.3.1";
 const SKIP_DIRS = new Set([
   "node_modules", ".git", ".next", ".nuxt", ".cache", ".vercel",
   ".firebase", "coverage", ".turbo", ".svelte-kit", "vendor",
@@ -175,51 +175,77 @@ const ownerVar = (chain) => {
   for (const p of chain) for (const m of p.matchAll(/\{([A-Za-z_]\w*)(=\*\*)?\}/g)) if (/user|uid|owner|author|member|account/i.test(m[1])) return m[1];
   return null;
 };
-// 1行の中の allow 文を取り出す：[{ ops, cond, bare }]。条件を書かない allow（`allow read;`）は cond が true・bare が true
-// （公式：条件のない allow は、そのメソッドを常に許可する）
-function allowsIn(line) {
-  const out = [];
-  const re = /\ballow\s+([a-z,\s]+?)\s*(?::\s*if\s+([^;}]*)|(?=[;}]))/g;
-  let m;
-  while ((m = re.exec(line.replace(/\/\/.*$/, "")))) {
-    const ops = m[1].split(",").map((s) => s.trim()).filter(Boolean);
-    if (m[2] === undefined) out.push({ ops, cond: "true", bare: true });
-    else out.push({ ops, cond: m[2].trim() });
+// ルールの文字列を、頭から一度だけ読む。数えるのは文字列（' "）・コメント（// と /* */）・括弧と { } の深さだけ。行の境目は見ない。
+// allow の文は「allow から、深さ0の ; まで」。その前に { か }、別の allow・match、ファイルの終わりが来た文は closed=false（その文だけが判定できなかった行になる。他の文には影響しない）
+// 返す物：[{ line, endLine, chain, ops, cond, bare, closed, ok, code }]（line は 0 始まり・chain はその allow が入っている match の並び・ok は ops と条件を読めたか）
+function readAllows(text) {
+  const n = text.length, out = [], stack = [];
+  const starts = [0];
+  for (let k = 0; k < n; k++) if (text[k] === "\n") starts.push(k + 1);
+  const lineOf = (pos) => { let lo = 0, hi = starts.length - 1; while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (starts[mid] <= pos) lo = mid; else hi = mid - 1; } return lo; };
+  const skipString = (i) => { const q = text[i]; let j = i + 1; while (j < n && text[j] !== q && text[j] !== "\n") { if (text[j] === "\\") j++; j++; } return j < n && text[j] === q ? j + 1 : Math.min(j, n); };
+  const skipComment = (i) => { if (text[i] === "/" && text[i + 1] === "/") { let j = i; while (j < n && text[j] !== "\n") j++; return j; } if (text[i] === "/" && text[i + 1] === "*") { const e = text.indexOf("*/", i + 2); return e < 0 ? n : e + 2; } return -1; };
+  const wordAt = (i) => { if (!/[A-Za-z_$]/.test(text[i]) || (i > 0 && /[\w$.]/.test(text[i - 1]))) return ""; const m = /[A-Za-z_$][\w$]*/y; m.lastIndex = i; return m.exec(text)[0]; };
+  const MATCH = /match\s+(\/(?:[^\s{}]|\{[^}\s]*\})*)\s*\{/y;
+  let i = 0, depth = 0;
+  while (i < n) {
+    const c = text[i];
+    if (c === '"' || c === "'") { i = skipString(i); continue; }
+    const sc = skipComment(i);
+    if (sc >= 0) { i = sc; continue; }
+    if (c === "{") { depth++; i++; continue; }
+    if (c === "}") { while (stack.length && stack[stack.length - 1].depth >= depth) stack.pop(); depth = Math.max(0, depth - 1); i++; continue; }
+    const w = wordAt(i);
+    if (w === "match") { MATCH.lastIndex = i; const m = MATCH.exec(text); if (m) { depth++; stack.push({ path: m[1], depth }); i = MATCH.lastIndex; continue; } }
+    if (w !== "allow") { i += w ? w.length : 1; continue; }
+    // allow の文：深さ0の ; まで。{ } か別の allow・match が先に来たら、そこで切って closed=false
+    const at = i; let j = i + w.length, p = 0, buf = "", closed = false;
+    while (j < n) {
+      const d = text[j];
+      if (d === '"' || d === "'") { const k = skipString(j); buf += text.slice(j, k); j = k; continue; }
+      const cm = skipComment(j);
+      if (cm >= 0) { buf += " "; j = cm; continue; }
+      if (d === "{" || d === "}") break;
+      if (d === "(" || d === "[") p++;
+      else if (d === ")" || d === "]") p = Math.max(0, p - 1);
+      else if (d === ";" && p === 0) { closed = true; j++; break; }
+      else if (/^(?:allow|match)$/.test(wordAt(j))) break;   // 括弧が閉じていなくても、別の allow・match が来たらそこで打ち切る
+      buf += d; j++;
+    }
+    const mm = /^\s*([a-z,\s]+?)\s*(?::\s*if\b([\s\S]*))?$/.exec(buf);
+    const ops = mm ? mm[1].split(",").map((x) => x.trim()).filter(Boolean) : [];
+    const ok = !!mm && ops.length > 0 && ops.every((o) => /^[a-z]+$/.test(o));
+    const bare = ok && mm[2] === undefined;
+    const line = lineOf(at), endLine = lineOf(Math.max(at, j - 1));
+    out.push({ line, endLine, chain: stack.map((x) => x.path), ops, cond: !ok ? "" : bare ? "true" : mm[2].trim(), bare, closed, ok, code: ("allow" + buf + (closed ? ";" : "")).replace(/\s+/g, " ").trim() });
+    i = j;
   }
   return out;
 }
-// 行の中の /* */ を落とす（複数行にまたがる分は inBlock で持ち回る）。allow を数える（判定できなかった行の検出）専用
-function stripBlockComments(lines) {
-  let inBlock = false;
-  return lines.map((ln) => {
-    let out = "", i = 0;
-    while (i < ln.length) {
-      if (inBlock) { const e = ln.indexOf("*/", i); if (e < 0) { i = ln.length; } else { inBlock = false; i = e + 2; } }
-      else { const b = ln.indexOf("/*", i); if (b < 0) { out += ln.slice(i); i = ln.length; } else { out += ln.slice(i, b); inBlock = true; i = b + 2; } }
-    }
-    return out.replace(/\/\/.*$/, "");
-  });
+// 1行（または1つの文字列）の中の完結した allow 文：[{ ops, cond, bare }]。条件を書かない allow（`allow read;`）は cond が true・bare が true
+// （公式：条件のない allow は、そのメソッドを常に許可する）
+function allowsIn(text) {
+  return readAllows(text).filter((a) => a.closed && a.ok).map((a) => (a.bare ? { ops: a.ops, cond: "true", bare: true } : { ops: a.ops, cond: a.cond }));
 }
-const COND_TRUE = /^true\s*(\|\||$)/;
 const COND_AUTH = /^request\.auth(\.uid)?\s*!=\s*null$/;
 const COND_TEST = /^request\.time\s*<\s*timestamp\.date\(\s*(\d{4})\s*,\s*(\d{1,2})\s*,\s*(\d{1,2})\s*\)$/;
-// 上の3つのほかに、中身を読めたと言える条件。&& でつないだ条件は、各項がすべて読める時だけ（|| があれば読めない）。
-// 項の種類：true／request.auth != null／絞り込み（false・持ち主の照合・request.auth.token.x ==・送るデータの検査）／それ以外＝読めない（関数・括弧など）
-const TERM_AUTH = /^request\.auth(\.uid)?\s*!=\s*null$/;
-const TERM_OWNER = /^false$|^request\.auth\.uid\s*==|==\s*request\.auth\.uid$|^request\.auth\.token\.\w+\s*==/;   // 誰かに絞る項
-const TERM_DATA = /^(request\.resource|resource)\.data\b/;                                                      // 送るデータの検査（誰が、には効かない）
-// 条件の種類："true"（誰でも）・"auth"（ログインしていれば誰でも）・"known"（読めて、上の2つではない）・"unknown"（読めない）
+// 条件の読み方：条件の「全体」が、次のどれか1つにぴったり一致した時だけ読めたとする。それ以外はすべて unknown（判定できなかった行）。
+// 部分一致や先頭の項だけでは決めない。&& か || を1つでも含む条件は、両辺が読めても読めたことにしない（true として扱うのも、全体がちょうど true の時だけ）
+const OPERAND = String.raw`(?:[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*|-?\d+(?:\.\d+)?|"[^"\\]*"|'[^'\\]*'|true|false|null)`;
+const TERM_CMP = new RegExp(`^(${OPERAND})\\s*(==|!=|<=|>=|<|>)\\s*(${OPERAND})$`);
+const TERM_IS = new RegExp(`^${OPERAND}\\s+is\\s+(?:string|int|float|number|bool|list|map|timestamp|path|latlng|bytes|duration)$`);
+// 条件の種類："true"（誰でも）・"auth"（ログインしていれば誰でも）・"known"（1つの比較・型の検査・false）・"unknown"（それ以外）
 function condKind(c) {
-  if (/\|\|/.test(c)) return "unknown";
-  const kinds = c.split("&&").map((x) => x.trim()).map((x) => (x === "true" ? "t" : TERM_AUTH.test(x) ? "a" : TERM_OWNER.test(x) ? "o" : TERM_DATA.test(x) ? "v" : "u"));
-  if (kinds.includes("u")) return "unknown";
-  if (kinds.includes("o")) return "known";
-  if (!kinds.includes("a")) return kinds.includes("t") ? "true" : "known";   // true だけ・true とデータの検査だけ＝誰でも
-  return kinds.includes("v") ? "known" : "auth";                              // auth だけ・true && auth ＝ログインしていれば誰でも
+  c = c.trim();
+  if (c === "true") return "true";
+  if (COND_AUTH.test(c)) return "auth";
+  if (/&&|\|\|/.test(c)) return "unknown";
+  if (c === "false" || TERM_CMP.test(c) || TERM_IS.test(c)) return "known";
+  return "unknown";
 }
 const COND_KNOWN = (c) => condKind(c) === "known";
-const COND_TRUEISH = (c) => COND_TRUE.test(c) || condKind(c) === "true";
-const COND_AUTHISH = (c) => COND_AUTH.test(c) || condKind(c) === "auth";
+const COND_TRUEISH = (c) => condKind(c) === "true";
+const COND_AUTHISH = (c) => condKind(c) === "auth";
 
 // コメント（// と /* */）と末尾のカンマを、文字列の外だけ落とす。コンソールのテストモードの rules や firebase init が書く形を読むため
 function looseJson(text) {
@@ -409,31 +435,29 @@ function runChecks(P) {
       continue;
     }
     const noun = /firebase\.storage/.test(text) ? "ファイル" : "文書";
-    const chains = matchChains(text);
     const lines = text.split(/\r?\n/);
     const G = { anyoneHard: [], anyoneSoft: [], authAll: [], authPart: [] };
     const tests = [];
     const unresolved = [];
-    const bare = stripBlockComments(lines);
-    for (let i = 0; i < lines.length; i++) {
-      const found = allowsIn(lines[i]);
-      // 判定できなかった allow：行に allow があるのに取り出せない（条件が次の行・複数行の ops など）／条件を読めない（関数・括弧・||）
-      const nAllow = (bare[i].match(/\ballow\b/g) || []).length;
-      const known = (a) => a.bare || COND_TRUEISH(a.cond) || COND_AUTHISH(a.cond) || COND_TEST.test(a.cond) || COND_KNOWN(a.cond);
-      if (nAllow && (nAllow > found.length || !found.every(known))) unresolved.push({ loc: `${f.rel}:${i + 1}`, code: lines[i].trim() });
-      for (const a of found) {
-        const whole = isWholeScope(chains[i]);
-        const ev = { loc: `${f.rel}:${i + 1}`, code: lines[i].trim(), ops: a.ops, chain: chains[i], bare: !!a.bare };
-        if (COND_TRUEISH(a.cond)) {
-          ev.mark = a.bare ? "条件なし" : "if " + a.cond.replace(/\s*\|\|.*$/, "");
-          (opFamily(a.ops).includes("w") || whole ? G.anyoneHard : G.anyoneSoft).push(ev);
-        } else if (COND_AUTHISH(a.cond)) {
-          ev.mark = a.cond;
-          (whole ? G.authAll : G.authPart).push(ev);
-        } else {
-          const t = a.cond.match(COND_TEST);
-          if (t) { ev.mark = a.cond; tests.push({ ev, y: +t[1], m: +t[2], d: +t[3] }); }
-        }
+    const seenLine = new Set();
+    for (const a of readAllows(text)) {
+      const code = a.line === a.endLine ? lines[a.line].trim() : a.code;
+      const read = a.closed && a.ok;
+      const known = read && (a.bare || COND_TRUEISH(a.cond) || COND_AUTHISH(a.cond) || COND_TEST.test(a.cond) || COND_KNOWN(a.cond));
+      // 判定できなかった allow：文が終わりまで読めない／ops・条件を読めない（関数・括弧・&&・||）。その文だけが対象で、他の文の判定には影響しない
+      if (!known && !seenLine.has(a.line)) { seenLine.add(a.line); unresolved.push({ loc: `${f.rel}:${a.line + 1}`, code }); }
+      if (!read) continue;
+      const whole = isWholeScope(a.chain);
+      const ev = { loc: `${f.rel}:${a.line + 1}`, code, ops: a.ops, chain: a.chain, bare: !!a.bare };
+      if (COND_TRUEISH(a.cond)) {
+        ev.mark = a.bare ? "条件なし" : "if " + a.cond;
+        (opFamily(a.ops).includes("w") || whole ? G.anyoneHard : G.anyoneSoft).push(ev);
+      } else if (COND_AUTHISH(a.cond)) {
+        ev.mark = a.cond;
+        (whole ? G.authAll : G.authPart).push(ev);
+      } else {
+        const t = a.cond.match(COND_TEST);
+        if (t) { ev.mark = a.cond; tests.push({ ev, y: +t[1], m: +t[2], d: +t[3] }); }
       }
     }
     const fam = (list) => opFamily(list.flatMap((e) => e.ops));
